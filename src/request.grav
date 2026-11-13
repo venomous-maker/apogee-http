@@ -116,6 +116,18 @@ namespace apogee {
             self.attrs = null; self.inputs = null; self.bodyValue = null; self.bodyParsed = false;
             self.cookieMap = null; self.files = null; self.methodName = "";
         }
+        // Takes over everything `other` holds, sharing its parsed input and
+        // attributes (a form request standing for the request it was made from).
+        fn adopt(other: Request) {
+            self.http = other.http; self.app = other.app; self.scoped = other.scoped;
+            self.routeName = other.routeName; self.routeValues = other.routeValues;
+            self.user = other.user; self.session = other.session;
+            other.all();                                                    // (parsed once, then shared)
+            self.attrs = other.attrs; self.inputs = other.inputs; self.bodyValue = other.bodyValue;
+            self.bodyParsed = other.bodyParsed; self.cookieMap = other.cookieMap; self.files = other.files;
+            self.methodName = other.methodName;
+            if (self.attrs == null) { other.set("apogee.shared", true); self.attrs = other.attrs; }
+        }
         // A request made up in code (tests, internal sub-requests).
         static fn make(method: string, target: string, body: string = "", contentType: string = "") -> Request {
             let h = new HttpRequest(method, target, "HTTP/1.1");
