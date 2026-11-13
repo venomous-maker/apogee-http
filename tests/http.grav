@@ -42,6 +42,7 @@ test "method spoofing, paths, globbing, negotiation" {
     assertEq(r.isMethod("patch"), true)
     assertEq(r.segment(3), "7")
     assertEq(r.pathIs(["admin/*"]), true)
+    assertEq(r.is(["admin/*"]) && r.string("_method") == "PATCH" && r.float("missing", 1.5) == 1.5, true)   // Laravel's names
     assertEq(r.pathIs(["admin/*/edit"]), true)
     assertEq(r.pathIs(["users/*"]), false)
     assertEq(r.url(), "http://localhost/admin/users/7/edit")
