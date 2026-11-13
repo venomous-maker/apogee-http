@@ -1,0 +1,51 @@
+// cookies.grav — signed cookies: a value plus an HMAC-SHA256 of it under the
+// application key, so a client can read it but not change it unnoticed.
+//
+//   let jar = new CookieJar(Config.getString("app.key"))
+//   res.withCookie(jar.make("theme", "dark", 60 * 24 * 365))   // signed, HttpOnly, SameSite=Lax
+//   jar.read(req, "theme")                                      // "" when absent or tampered with
+import "std"
+import "std/net"
+import "request.grav"
+
+namespace apogee {
+
+    class CookieJar {
+        private key: string
+        // Defaults for cookies it makes.
+        public path: string = "/"
+        public domain: string = ""
+        public secure: bool = false
+        public sameSite: string = "Lax"
+
+        constructor(key: string) {
+            if (key == "") { throw new ValueError("a cookie jar needs a key (app.key)"); }
+            self.key = key;
+        }
+
+        // "value.signature" (the signature: HMAC-SHA256 of name and value, hex).
+        fn sign(name: string, value: string) -> string { return value + "." + Hash.hmacSha256(self.key, name + "=" + value); }
+        // The value inside a signed text, or "" when its signature does not match.
+        fn verify(name: string, signed: string) -> string {
+            let dot = Str.lastIndexOf(signed, ".");
+            if (dot < 0) { return ""; }
+            let value = signed[..dot];
+            let expected = Hash.hmacSha256(self.key, name + "=" + value);
+            return Hash.equals(signed[dot + 1..], expected) ? value : "";
+        }
+        // A signed cookie: HttpOnly, for `minutes` (0: until the browser closes).
+        fn make(name: string, value: string, minutes: int = 0) -> Cookie {
+            let c = new Cookie(name, Url.encode(self.sign(name, value))).withPath(self.path).httpOnly(true).withSameSite(self.sameSite).secure(self.secure);
+            if (self.domain != "") { c.withDomain(self.domain); }
+            if (minutes > 0) { c.maxAge(minutes * 60); }
+            return c;
+        }
+        // A cookie that removes `name` from the browser.
+        fn forget(name: string) -> Cookie { return new Cookie(name, "").withPath(self.path).maxAge(0); }
+        // A signed cookie's value from the request ("" when absent or changed).
+        fn read(req: Request, name: string) -> string {
+            let raw = req.cookie(name);
+            return raw == "" ? "" : self.verify(name, Url.decode(raw));
+        }
+    }
+}
