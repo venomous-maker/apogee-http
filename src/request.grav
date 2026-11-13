@@ -84,6 +84,8 @@ namespace apogee {
         // The matched route's parameter values in order (bound models where the
         // router bound one); null before routing, or for a route without any.
         public routeValues: Array<any>
+        // The matched route's parameter names, in the same order (null before routing).
+        public routeParamNames: Array<string>
         // The authenticated user, once a guard has found one (null for a guest).
         public user: any
         // The session, once a session middleware has started one.
@@ -111,6 +113,7 @@ namespace apogee {
             self.scoped = null;
             self.routeName = "";
             self.routeValues = null;
+            self.routeParamNames = null;
             self.user = null;
             self.session = null;
             self.attrs = null; self.inputs = null; self.bodyValue = null; self.bodyParsed = false;
@@ -120,7 +123,7 @@ namespace apogee {
         // attributes (a form request standing for the request it was made from).
         fn adopt(other: Request) {
             self.http = other.http; self.app = other.app; self.scoped = other.scoped;
-            self.routeName = other.routeName; self.routeValues = other.routeValues;
+            self.routeName = other.routeName; self.routeValues = other.routeValues; self.routeParamNames = other.routeParamNames;
             self.user = other.user; self.session = other.session;
             other.all();                                                    // (parsed once, then shared)
             self.attrs = other.attrs; self.inputs = other.inputs; self.bodyValue = other.bodyValue;
