@@ -22,6 +22,27 @@ req.set("tenant", t)  req.get("tenant")             // what middleware leaves fo
 req.make::<Mailer>()                                // from the request's container scope (made on first use)
 ```
 
+More, in Laravel's spelling:
+
+```grav
+req.string("q")  req.float("price")  req.is(["admin/*"])          // (text, number, pathIs)
+req.input("items.*.sku")            // wildcards: every match, as an Array<any>
+req.hasAll([...])  req.anyFilled([...])  req.isNotFilled("x")  req.keys()  req.map("address")
+req.whenHas("coupon", fn(v: any) { ... }).whenFilled("q", fn(v: any) { ... }, fn() { ... }).whenMissing("x", fn() { ... })
+req.only(["user.name"])             // keeps nesting: {"user": {"name": ...}}
+req.mergeIfMissing(values)  req.replace(values)  req.post("field")  req.queryAll()  req.date("when", "%d/%m/%Y")
+req.old("email")  req.flash()  req.flashOnly([...])  req.flashExcept(["password"])   // with a session
+req.validate(rules)  req.validated()                                                // with apogee-validation
+req.route("post")  req.userAs::<User>()  req.allFiles()  req.hasCookie("x")  req.content()
+req.prefers(["json", "html"])  req.accepts("text/csv")  req.acceptsJson()  req.format()  req.pjax()  req.prefetch()
+req.ip()  req.ips()  req.scheme()  req.httpHost()  req.port()                       // through trusted proxies
+req.fullUrlWithQuery({"page": 2})  req.fullUrlWithoutQuery(["page"])  req.fingerprint()
+```
+
+`Request.trustedProxies` (addresses, `"10.0.*"`, or `"*"`) decides whose
+X-Forwarded-For/-Proto/-Host to believe. `accepts`, `prefers` and `format`
+read the Accept header by quality.
+
 Every parse (query, form, JSON body, cookies, files) happens once per
 request, on first use. A JSON body that does not parse is a 400.
 
