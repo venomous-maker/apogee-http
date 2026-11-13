@@ -1,0 +1,183 @@
+// apogee-http's tests: request input from every source, typed and dotted;
+// method spoofing, paths and content negotiation; uploads; responses and HTTP
+// errors; the middleware pipeline; API resources and pages; signed cookies;
+// the JSON writer.
+import "std"
+import "std/net"
+import "../src/all.grav"
+use apogee.*
+
+test "input: query, form and JSON bodies merged, typed, dotted" {
+    let r = Request.make("POST", "/users?page=2&q=ada", "{\"user\": {\"name\": \"Ada\", \"tags\": [\"x\", \"y\"]}, \"age\": 36, \"admin\": true}", "application/json")
+    assertEq(r.integer("page"), 2 as long)
+    assertEq(r.text("q"), "ada")
+    assertEq(r.text("user.name"), "Ada")
+    assertEq(r.text("user.tags.1"), "y")
+    assertEq(r.integer("age"), 36 as long)
+    assertEq(r.boolean("admin"), true)
+    assertEq(r.has("user.missing"), false)
+    assertEq(r.input("nope", "fallback") as string, "fallback")
+    assertEq(r.only(["age", "q", "zzz"]).size(), 2)
+    assertEq(r.except(["user"]).containsKey("user"), false)
+
+    let f = Request.make("POST", "/x", "name=Grace+Hopper&remember=on&n=+7+&csv=a,%20b&empty=", "application/x-www-form-urlencoded")
+    assertEq(f.text("name"), "Grace Hopper")
+    assertEq(f.boolean("remember"), true)
+    assertEq(f.integer("n"), 7 as long)
+    assertEq(f.list("csv").size(), 2)
+    assertEq(f.filled("empty"), false)
+    assertEq(f.has("empty"), true)
+    f.merge({"name": "changed" as any})
+    assertEq(f.text("name"), "changed")
+
+    let bad = Request.make("POST", "/x", "{not json", "application/json")
+    let status = 0
+    try { bad.all() } catch (e: HttpException) { status = e.status }
+    assertEq(status, 400)
+}
+
+test "method spoofing, paths, globbing, negotiation" {
+    let r = Request.make("POST", "/admin/users/7/edit", "_method=PATCH", "application/x-www-form-urlencoded")
+    assertEq(r.method(), "PATCH")
+    assertEq(r.isMethod("patch"), true)
+    assertEq(r.segment(3), "7")
+    assertEq(r.pathIs(["admin/*"]), true)
+    assertEq(r.pathIs(["admin/*/edit"]), true)
+    assertEq(r.pathIs(["users/*"]), false)
+    assertEq(r.url(), "http://localhost/admin/users/7/edit")
+    let api = Request.make("GET", "/")
+    api.http.headers.set("Accept", "application/json")
+    assertEq(api.expectsJson(), true)
+    let page = Request.make("GET", "/")
+    page.http.headers.set("Accept", "text/html,application/xhtml+xml")
+    assertEq(page.expectsJson(), false)
+    page.routeName = "admin.users.show"
+    assertEq(page.routeIs(["admin.*"]), true)
+    let get = Request.make("GET", "/?_method=DELETE")
+    assertEq(get.method(), "GET")                                    // only POST is spoofed
+}
+
+test "uploads: names, extensions, storing" {
+    let fd = new FormData()
+    fd.add("title", "Holiday")
+    fd.addFile("photo", "../../etc/Beach.JPG", "image/jpeg", Bytes.fromString("not really a jpeg"))
+    let r = Request.make("POST", "/upload")
+    r.http.headers.set("Content-Type", fd.contentType())
+    r.http.bodyBytes = fd.body()
+    assertEq(r.text("title"), "Holiday")
+    let f = r.file("photo")
+    assertEq("${f.clientName()} ${f.extension()} ${f.size()} ${f.mimeType()}", "Beach.JPG jpg 17 image/jpeg")
+    let dir = "${Dir.temp()}/apogee-http-${Process.pid()}"
+    let path = f.store(dir)
+    assertEq(Str.endsWith(path, ".jpg"), true)
+    assertEq(new File(path).readOr(""), "not really a jpeg")
+    let msg = ""
+    try { f.store(dir, "../escape.txt") } catch (e: ValueError) { msg = e.message() }
+    assertEq(Str.contains(msg, "not a plain file name"), true)
+    assertEq(r.file("nope") == null, true)
+    Dir.removeAll(dir)
+}
+
+test "responses, and HTTP errors rendered for the client" {
+    let r = Response.json({"ok": true as any}, 201).header("X-Id", "9")
+    assertEq("${r.statusCode()} ${r.body()} ${r.getHeader("X-Id")} ${r.getHeader("Content-Type")}", "201 {\"ok\":true} 9 application/json")
+    assertEq(Response.redirect("/login").isRedirect(), true)
+    assertEq(Response.noContent().statusCode(), 204)
+    let api = Request.make("GET", "/")
+    api.http.headers.set("Accept", "application/json")
+    let e = new HttpException(429).withHeader("Retry-After", "30")
+    let out = e.render(api)
+    assertEq("${out.statusCode()} ${out.body()} ${out.getHeader("Retry-After")}", "429 {\"message\":\"Too Many Requests\"} 30")
+    let html = new HttpException(404, "No <such> page").render(Request.make("GET", "/"))
+    assertEq(Str.contains(html.body(), "No &lt;such&gt; page"), true)
+    let status = 0
+    try { abortIf(true, 403) } catch (x: HttpException) { status = x.status }
+    assertEq(status, 403)
+}
+
+class Tag implements Middleware {
+    public name: string
+    constructor(name: string) { self.name = name }
+    fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+        req.set("trail", (req.get("trail", "") as string) + self.name + ">")
+        let res = next(req)
+        return res.header("X-After-" + self.name, "1")
+    }
+}
+
+test "the pipeline runs middleware outermost first, and can stop early" {
+    let layers = new Array<Middleware>()
+    layers.push(new Tag("a"))
+    layers.push(new Tag("b"))
+    layers.push(new FnMiddleware(fn(req: Request, next: fn(Request) -> Response) -> Response {
+        if (req.query("stop") == "1") { return Response.text("stopped", 401) }
+        return next(req)
+    }))
+    let run = Pipeline.compose(layers, fn(req: Request) -> Response { return Response.text(req.get("trail") as string) })
+    let ok = run(Request.make("GET", "/"))
+    assertEq("${ok.body()} ${ok.getHeader("X-After-a")} ${ok.getHeader("X-After-b")}", "a>b> 1 1")
+    assertEq(run(Request.make("GET", "/?stop=1")).statusCode(), 401)
+}
+
+class User { public id: long  public name: string  public email: string  public bio: string?
+    constructor(id: long, name: string, email: string) { self.id = id; self.name = name; self.email = email; self.bio = null } }
+class UserResource extends JsonResource {
+    constructor(u: any) { super(u) }
+    fn toArray(req: Request) -> HashMap<string, any> {
+        let u = self.resource as User
+        return self.fields().add("id", u.id).add("name", u.name)
+            .when(req.boolean("admin"), "email", u.email)
+            .whenNotNull("bio", u.bio)
+            .build()
+    }
+    fn with(req: Request) -> HashMap<string, any> { return {"version": "1" as any} }
+}
+
+test "API resources, collections and pages" {
+    let ada = new User(1, "Ada", "ada@example.com")
+    let one = new UserResource(ada).toResponse(Request.make("GET", "/?admin=1")).data() as HashMap<string, any>
+    let d = one["data"] as HashMap<string, any>
+    assertEq("${d["id"]} ${d["email"]} ${d.containsKey("bio")} ${one["version"]}", "1 ada@example.com false 1")
+    let plain = new UserResource(ada).toResponse(Request.make("GET", "/")).data() as HashMap<string, any>
+    assertEq((plain["data"] as HashMap<string, any>).containsKey("email"), false)
+
+    let all = new Array<any>()
+    for (i in 1..26) { all.push(new User(i as long, "u${i}", "")) }
+    let page = Paginator.slice(all, 10, 3, "/users?sort=name")
+    let body = ResourceCollection.paged(page, fn(u: any) -> JsonResource { return new UserResource(u) })
+        .toResponse(Request.make("GET", "/")).data() as HashMap<string, any>
+    let meta = body["meta"] as HashMap<string, any>
+    let links = body["links"] as HashMap<string, any>
+    assertEq("${(body["data"] as Array<any>).size()} ${meta["last_page"]} ${meta["from"]} ${meta["to"]}", "5 3 21 25")
+    assertEq("${links["prev"]} ${links["next"] == null}", "/users?sort=name&page=2 true")
+}
+
+test "signed cookies: readable, not changeable" {
+    let jar = new CookieJar("test-key")
+    let c = jar.make("theme", "dark", 60)
+    assertEq(c.isHttpOnly, true)
+    assertEq(c.maxAgeSeconds, 3600)
+    let r = Request.make("GET", "/")
+    r.http.headers.set("Cookie", "theme=" + c.value + "; other=1")
+    assertEq(jar.read(r, "theme"), "dark")
+    let forged = Request.make("GET", "/")
+    forged.http.headers.set("Cookie", "theme=" + Url.encode(Str.replace(Url.decode(c.value), "dark", "lite")))
+    assertEq(jar.read(forged, "theme"), "")
+    assertEq(new CookieJar("other-key").read(r, "theme"), "")         // another key: not ours
+    assertEq(jar.verify("other", jar.sign("theme", "dark")), "")       // bound to its name
+}
+
+class Point { public x: int = 1  public y: int = 2  private secret: string = "no" }
+
+test "the JSON writer: escapes, objects, nesting" {
+    assertEq(JsonWriter.encode("a\"b\\c\nd\u{1}"), "\"a\\\"b\\\\c\\nd\\u0001\"")
+    let mixed = new Array<any>(); mixed.push(1); mixed.push(2.5); mixed.push(null); mixed.push("x")
+    assertEq(JsonWriter.encode(mixed), "[1,2.5,null,\"x\"]")
+    let p = JsonWriter.encode(reflect(Point).create())
+    assertEq(p, "{\"x\":1,\"y\":2}")
+    let flags = new Array<any>(); flags.push(true); flags.push(false)
+    let inner = new HashMap<string, any>(); inner.put("b", flags)
+    let outer = new HashMap<string, any>(); outer.put("a", inner)
+    let nested = Plain.parse(JsonWriter.encode(outer)) as HashMap<string, any>
+    assertEq(JsonWriter.encode(nested), "{\"a\":{\"b\":[true,false]}}")
+}
