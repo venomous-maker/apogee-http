@@ -1,0 +1,108 @@
+// negotiation.grav — what a client accepts (the Accept header, by quality),
+// and which proxies' forwarded headers to believe.
+import "std"
+
+namespace apogee {
+
+    // One media range of an Accept header: "text/html;q=0.9".
+    class MediaRange {
+        public mime: string
+        public quality: double
+        public order: int
+        constructor(mime: string, quality: double, order: int) { self.mime = mime; self.quality = quality; self.order = order; }
+        // Whether this range covers `mime` ("*/*", "text/*", or exact).
+        fn covers(mime: string) -> bool {
+            if (self.mime == "*/*" || self.mime == "*") { return true; }
+            if (Str.endsWith(self.mime, "/*")) { return Str.startsWith(mime, self.mime[..self.mime.length - 1]); }
+            return self.mime == mime;
+        }
+    }
+
+    class AcceptHeader {
+        // The ranges, best first (by quality, then as written); none for an
+        // empty header (which accepts anything).
+        static fn parse(header: string) -> Array<MediaRange> {
+            let out = new Array<MediaRange>();
+            let i = 0;
+            for (part in Str.split(header, ",")) {
+                let bits = Str.split(part, ";");
+                let mime = Str.lower(Str.trim(bits[0]));
+                if (mime == "") { continue; }
+                let q = 1.0;
+                for (j in 1..bits.size()) {
+                    let p = Str.trim(bits[j]);
+                    if (Str.startsWith(p, "q=")) { q = Format.toFloatOr(p[2..], 1.0); }
+                }
+                out.push(new MediaRange(mime, q, i));
+                i += 1;
+            }
+            out.sortBy(fn(a: MediaRange, b: MediaRange) -> int {
+                if (a.quality != b.quality) { return a.quality > b.quality ? -1 : 1; }
+                return a.order - b.order;
+            });
+            return out;
+        }
+        // The quality the client gives `mime` (0 when it does not accept it).
+        static fn quality(ranges: Array<MediaRange>, mime: string) -> double {
+            if (ranges.size() == 0) { return 1.0; }
+            let best = 0.0;
+            let specificity = -1;
+            for (r in ranges) {
+                if (!r.covers(mime)) { continue; }
+                let s = r.mime == mime ? 2 : (Str.endsWith(r.mime, "/*") && r.mime != "*/*" ? 1 : 0);
+                if (s > specificity) { specificity = s; best = r.quality; }
+            }
+            return best;
+        }
+        // Of `offered`, the one the client likes best ("" when it accepts none).
+        static fn prefer(ranges: Array<MediaRange>, offered: Array<string>) -> string {
+            let best = "";
+            let bestQ = 0.0;
+            for (o in offered) {
+                let mime = AcceptHeader.expand(o);
+                let q = AcceptHeader.quality(ranges, mime);
+                if (q > bestQ) { bestQ = q; best = o; }
+            }
+            return best;
+        }
+        // "json" -> "application/json", "html" -> "text/html", ... (a full type as it is).
+        static fn expand(short: string) -> string {
+            switch (short) {
+                case "json": return "application/json"
+                case "html": return "text/html"
+                case "text", "txt": return "text/plain"
+                case "xml": return "application/xml"
+                case "csv": return "text/csv"
+                case "pdf": return "application/pdf"
+                case "js": return "application/javascript"
+                case "css": return "text/css"
+                default: return Str.lower(short)
+            }
+        }
+    }
+
+    // Which proxies to believe about the client (X-Forwarded-For, -Proto,
+    // -Host, -Port): addresses, or "*" for any (behind a load balancer you
+    // control).
+    class TrustedProxies {
+        static fn trusts(proxies: Array<string>, address: string) -> bool {
+            if (proxies.size() == 0) { return false; }
+            let ip = TrustedProxies.hostOf(address);
+            for (p in proxies) {
+                if (p == "*" || p == ip) { return true; }
+                if (Str.endsWith(p, ".*") && Str.startsWith(ip, p[..p.length - 1])) { return true; }
+            }
+            return false;
+        }
+        // "1.2.3.4:5678" -> "1.2.3.4"; "[::1]:80" -> "::1".
+        static fn hostOf(address: string) -> string {
+            if (Str.startsWith(address, "[")) {
+                let end = Str.indexOf(address, "]");
+                return end > 0 ? address[1..end] : address;
+            }
+            let colon = Str.lastIndexOf(address, ":");
+            if (colon > 0 && Str.indexOf(address, ":") == colon) { return address[..colon]; }
+            return address;
+        }
+    }
+}
