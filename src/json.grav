@@ -1,0 +1,179 @@
+// json.grav — JsonWriter: any plain value or object as JSON text, written
+// straight into one buffer (no JsonValue tree in between), and Plain: JSON
+// back into plain values.
+//
+//   JsonWriter.encode(map)            // {"id":1,"tags":["a","b"],"owner":{"name":"Ada"}}
+//
+// What it writes: null, bool, numbers, strings (escaped), DateTime and
+// Decimal as strings, Array/HashMap/JsonValue, a JsonResource (its toArray),
+// an object with a toMap() method (as models have), else an object's public
+// fields by reflection, else its text.
+import "std"
+
+namespace apogee {
+
+    // Something that knows its own JSON form (a resource, a model).
+    interface Arrayable {
+        fn toMap() -> HashMap<string, any>
+    }
+
+    class JsonWriter {
+        static fn encode(v: any) -> string {
+            let sb = new StringBuilder();
+            JsonWriter.write(sb, v, 0);
+            return sb.toString();
+        }
+        // Indented two spaces a level (for humans: logs, `route:list --json`).
+        static fn pretty(v: any) -> string { return JsonWriter.toValue(v).pretty(); }
+
+        static fn write(sb: StringBuilder, v: any, depth: int) {
+            if (depth > 64) { throw new ValueError("JSON nested more than 64 levels deep (a cycle?)"); }
+            if (v == null) { sb.append("null"); return; }
+            if (v is string) { JsonWriter.str(sb, v as string); return; }
+            if (v is long) { sb.appendInt(v as long); return; }
+            if (v is int) { sb.appendInt((v as int) as long); return; }
+            if (v is bool) { sb.append((v as bool) ? "true" : "false"); return; }
+            if (v is double) {
+                let d = v as double;
+                if (d != d || d - d != 0.0) { sb.append("null"); return; }     // NaN, infinities: not JSON
+                sb.appendFloat(d);
+                return;
+            }
+            if (v is float) { sb.appendFloat((v as float) as double); return; }
+            if (v is Array<any>) {
+                sb.appendChar(91);
+                let first = true;
+                for (x in v as Array<any>) {
+                    if (!first) { sb.appendChar(44); }
+                    first = false;
+                    JsonWriter.write(sb, x, depth + 1);
+                }
+                sb.appendChar(93);
+                return;
+            }
+            if (v is HashMap<string, any>) { JsonWriter.map(sb, v as HashMap<string, any>, depth); return; }
+            if (v is HashMap<string, string>) {
+                let m = new HashMap<string, any>();
+                (v as HashMap<string, string>).forEach(fn(k: string, s: string) { m.put(k, s); });
+                JsonWriter.map(sb, m, depth);
+                return;
+            }
+            if (v is Array<string>) {
+                sb.appendChar(91);
+                let first = true;
+                for (x in v as Array<string>) { if (!first) { sb.appendChar(44); } first = false; JsonWriter.str(sb, x); }
+                sb.appendChar(93);
+                return;
+            }
+            if (v is JsonValue) { sb.append((v as JsonValue).toJson()); return; }
+            if (v is DateTime) { JsonWriter.str(sb, (v as DateTime).format("%Y-%m-%dT%H:%M:%S")); return; }
+            if (v is Decimal) { JsonWriter.str(sb, (v as Decimal).toString()); return; }
+            if (v is Arrayable) { JsonWriter.map(sb, (v as Arrayable).toMap(), depth); return; }
+            let info = ClassInfo.of(v);
+            if (info != null && info.isReflected()) {
+                let toMap = info.method("toMap");
+                if (toMap != null && toMap.paramCount() == 0 && toMap.canInvoke()) {
+                    JsonWriter.write(sb, toMap.invoke(v), depth + 1);
+                    return;
+                }
+                let m = new HashMap<string, any>();
+                let order = new Array<string>();
+                for (f in info.fields()) {
+                    if (f.isPrivate() || f.isProtected() || !f.canGet() || f.has("Hidden")) { continue; }
+                    m.put(f.name, f.get(v));
+                    order.push(f.name);
+                }
+                JsonWriter.ordered(sb, m, order, depth);
+                return;
+            }
+            JsonWriter.str(sb, str(v));
+        }
+        private static fn map(sb: StringBuilder, m: HashMap<string, any>, depth: int) {
+            sb.appendChar(123);
+            let open = sb.length();                     // (anything past it means a member was written)
+            m.forEach(fn(k: string, x: any) {
+                if (sb.length() > open) { sb.appendChar(44); }
+                JsonWriter.str(sb, k);
+                sb.appendChar(58);
+                JsonWriter.write(sb, x, depth + 1);
+            });
+            sb.appendChar(125);
+        }
+        private static fn ordered(sb: StringBuilder, m: HashMap<string, any>, order: Array<string>, depth: int) {
+            sb.appendChar(123);
+            for (i, k in order) {
+                if (i > 0) { sb.appendChar(44); }
+                JsonWriter.str(sb, k);
+                sb.appendChar(58);
+                JsonWriter.write(sb, m[k], depth + 1);
+            }
+            sb.appendChar(125);
+        }
+        // A JSON string literal: quotes, backslashes and control characters escaped.
+        static fn str(sb: StringBuilder, s: string) {
+            sb.appendChar(34);
+            let n = s.length;
+            let start = 0;
+            for (i in 0..n) {
+                let c = s[i] as int;
+                if (c >= 32 && c != 34 && c != 92) { continue; }
+                if (i > start) { sb.append(s[start..i]); }
+                if (c == 34) { sb.append("\\\""); }
+                else if (c == 92) { sb.append("\\\\"); }
+                else if (c == 10) { sb.append("\\n"); }
+                else if (c == 13) { sb.append("\\r"); }
+                else if (c == 9) { sb.append("\\t"); }
+                else { sb.append("\\u00").append(JsonWriter.hex2(c)); }
+                start = i + 1;
+            }
+            if (start == 0) { sb.append(s); } else if (start < n) { sb.append(s[start..]); }
+            sb.appendChar(34);
+        }
+        private static fn hex2(c: int) -> string {
+            let digits = "0123456789abcdef";
+            return digits[(c >> 4) & 15..((c >> 4) & 15) + 1] + digits[c & 15..(c & 15) + 1];
+        }
+        // As a JsonValue tree (for pretty printing, or handing to other JSON code).
+        static fn toValue(v: any) -> JsonValue { return Json.parse(JsonWriter.encode(v)); }
+    }
+
+    // JSON as plain values: null, bool, long, double, string, Array<any>,
+    // HashMap<string, any>.
+    class Plain {
+        static fn fromJson(j: JsonValue) -> any {
+            if (j == null || j.isNull()) { return null; }
+            if (j.isBool()) { return j.asBool(); }
+            if (j.isInteger()) { return j.asLong(); }
+            if (j.isNumber()) { return j.asFloat(); }
+            if (j.isString()) { return j.asString(); }
+            if (j.isArray()) {
+                let out = new Array<any>();
+                for (x in j.asArray()) { out.push(Plain.fromJson(x)); }
+                return out;
+            }
+            let out = new HashMap<string, any>();
+            for (k in j.keys()) { out.put(k, Plain.fromJson(j.get(k))); }
+            return out;
+        }
+        static fn parse(text: string) -> any { return Plain.fromJson(Json.parse(text)); }
+        // The value at a dotted path in nested maps and arrays ("user.tags.0").
+        static fn dig(v: any, path: string) -> any {
+            let cur = v;
+            for (part in Str.split(path, ".")) {
+                if (cur is HashMap<string, any>) {
+                    let m = cur as HashMap<string, any>;
+                    if (!m.containsKey(part)) { return null; }
+                    cur = m[part];
+                } else if (cur is Array<any>) {
+                    let i = Format.toIntOr(part, -1);
+                    let a = cur as Array<any>;
+                    if (i < 0 || i >= a.size()) { return null; }
+                    cur = a[i];
+                } else {
+                    return null;
+                }
+            }
+            return cur;
+        }
+    }
+}
