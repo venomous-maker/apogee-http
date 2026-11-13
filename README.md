@@ -19,7 +19,7 @@ req.method()            // a POST form's _method (or X-HTTP-Method-Override) giv
 req.pathIs(["admin/*"])  req.routeIs(["admin.*"])  req.segment(2)  req.url()  req.fullUrl()
 req.expectsJson()  req.wantsJson()  req.ajax()  req.bearerToken()  req.ip()  req.cookie("x")
 req.set("tenant", t)  req.get("tenant")             // what middleware leaves for later
-req.make::<Mailer>()                                // from the request's container scope
+req.make::<Mailer>()                                // from the request's container scope (made on first use)
 ```
 
 Every parse (query, form, JSON body, cookies, files) happens once per
