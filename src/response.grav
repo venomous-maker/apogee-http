@@ -1,0 +1,149 @@
+// response.grav — Response: what a handler gives back, built fluently, and
+// the HTTP errors a handler throws instead (HttpException, abort()).
+//
+//   return Response.json(user)                         // any plain value or object
+//   return Response.json(errors, 422)
+//   return Response.redirect("/login").withCookie(new Cookie("seen", "1"))
+//   return Response.view(html).header("X-Frame-Options", "DENY")
+//   abort(404)                                         // or throw new HttpException(403, "...")
+import "std"
+import "std/net"
+import "json.grav"
+import "request.grav"
+
+namespace apogee {
+
+    class Response {
+        // The response as it will be sent.
+        public http: HttpResponse
+        constructor(http: HttpResponse) { self.http = http; }
+
+        static fn json(value: any, status: int = 200) -> Response {
+            return new Response(HttpResponse.of(status, "application/json", JsonWriter.encode(value)));
+        }
+        static fn text(body: string, status: int = 200) -> Response { return new Response(HttpResponse.text(status, body)); }
+        static fn html(body: string, status: int = 200) -> Response { return new Response(HttpResponse.of(status, "text/html; charset=utf-8", body)); }
+        // (a rendered view's HTML)
+        static fn view(html: string, status: int = 200) -> Response { return Response.html(html, status); }
+        static fn status(code: int) -> Response { return new Response(new HttpResponse(code)); }
+        static fn noContent() -> Response { return Response.status(204); }
+        // 201 with the created thing (and a Location when given).
+        static fn created(value: any, location: string = "") -> Response {
+            let r = Response.json(value, 201);
+            if (location != "") { r.header("Location", location); }
+            return r;
+        }
+        static fn redirect(location: string, status: int = 302) -> Response { return new Response(HttpResponse.redirect(location, status)); }
+        // To where the client came from (its Referer), else `fallback`.
+        static fn back(req: Request, fallback: string = "/") -> Response {
+            let ref = req.header("Referer");
+            return Response.redirect(ref != "" ? ref : fallback);
+        }
+        // A file to show in the browser.
+        static fn file(path: string) -> Response { return new Response(HttpResponse.file(path)); }
+        // A file to save, as `name` (its own name when "").
+        static fn download(path: string, name: string = "") -> Response {
+            let r = HttpResponse.file(path);
+            let shown = name != "" ? name : Path.basename(path);
+            return new Response(r.attachment(shown));
+        }
+        static fn stream(contentType: string, write: fn(ResponseWriter)) -> Response { return new Response(HttpResponse.stream(contentType, write)); }
+
+        // ── changing it ────────────────────────────────────────────────────────
+        fn header(name: string, value: string) -> Response { self.http.header(name, value); return self; }
+        fn withHeaders(values: HashMap<string, string>) -> Response {
+            values.forEach(fn(k: string, v: string) { self.http.header(k, v); });
+            return self;
+        }
+        fn withStatus(code: int) -> Response { self.http.status = code; return self; }
+        fn withCookie(c: Cookie) -> Response { self.http.setCookie(c); return self; }
+        fn withoutCookie(name: string, path: string = "/") -> Response { self.http.setCookie(new Cookie(name, "").withPath(path).maxAge(0)); return self; }
+        fn contentType(value: string) -> Response { self.http.contentType(value); return self; }
+        fn noCache() -> Response { self.http.noCache(); return self; }
+
+        // ── reading it (tests, middleware) ─────────────────────────────────────
+        fn statusCode() -> int { return self.http.status; }
+        fn body() -> string { return self.http.body(); }
+        fn getHeader(name: string) -> string { return self.http.getHeader(name); }
+        // The body parsed as JSON, as plain values.
+        fn data() -> any { return Plain.parse(self.http.body()); }
+        fn ok() -> bool { return self.http.ok(); }
+        fn isRedirect() -> bool { return self.http.isRedirect(); }
+    }
+
+    // An exception that knows the response it stands for.
+    interface Renderable {
+        fn render(req: Request) -> Response
+    }
+
+    // An HTTP error a handler throws: the status, a message for the client,
+    // and any headers (Retry-After, WWW-Authenticate, ...).
+    class HttpException extends Exception implements Renderable {
+        public status: int
+        public headers: HashMap<string, string>
+        constructor(status: int, message: string = "") {
+            super(message == "" ? HttpException.reason(status) : message);
+            self.status = status;
+            self.headers = new HashMap<string, string>();
+        }
+        public fn kind() -> string { return "HttpException"; }
+        fn withHeader(name: string, value: string) -> HttpException { self.headers.put(name, value); return self; }
+        // JSON ({"message": ...}) for a client that expects it, else a small
+        // HTML page.
+        fn render(req: Request) -> Response {
+            let r: Response = null;
+            if (req.expectsJson()) {
+                let m = new HashMap<string, any>();
+                m.put("message", self.message());
+                r = Response.json(m, self.status);
+            } else {
+                r = Response.html(HttpException.page(self.status, self.message()), self.status);
+            }
+            self.headers.forEach(fn(k: string, v: string) { r.header(k, v); });
+            return r;
+        }
+        static fn page(status: int, message: string) -> string {
+            let safe = HttpException.escape(message);
+            return "<!doctype html><html><head><meta charset=\"utf-8\"><title>${status} ${safe}</title>" +
+                   "<style>body{font:16px system-ui,sans-serif;display:grid;place-items:center;height:90vh;margin:0;color:#334}" +
+                   "h1{font-size:3rem;margin:0;color:#89a}p{margin:.5rem 0 0}</style></head>" +
+                   "<body><main><h1>${status}</h1><p>${safe}</p></main></body></html>";
+        }
+        static fn escape(s: string) -> string {
+            if (Str.indexOf(s, "<") < 0 && Str.indexOf(s, ">") < 0 && Str.indexOf(s, "&") < 0 && Str.indexOf(s, "\"") < 0 && Str.indexOf(s, "'") < 0) { return s; }
+            return Str.replace(Str.replace(Str.replace(Str.replace(Str.replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), "\"", "&quot;"), "'", "&#39;");
+        }
+        static fn reason(status: int) -> string {
+            switch (status) {
+                case 400: return "Bad Request"
+                case 401: return "Unauthorized"
+                case 402: return "Payment Required"
+                case 403: return "Forbidden"
+                case 404: return "Not Found"
+                case 405: return "Method Not Allowed"
+                case 406: return "Not Acceptable"
+                case 408: return "Request Timeout"
+                case 409: return "Conflict"
+                case 410: return "Gone"
+                case 413: return "Payload Too Large"
+                case 415: return "Unsupported Media Type"
+                case 419: return "Page Expired"
+                case 422: return "Unprocessable Content"
+                case 423: return "Locked"
+                case 429: return "Too Many Requests"
+                case 500: return "Server Error"
+                case 501: return "Not Implemented"
+                case 502: return "Bad Gateway"
+                case 503: return "Service Unavailable"
+                case 504: return "Gateway Timeout"
+                default: return status >= 500 ? "Server Error" : "Error"
+            }
+        }
+    }
+
+    // Throws the HttpException for `status` (and `message`).
+    fn abort(status: int, message: string = "") { throw new HttpException(status, message); }
+    // Throws it when `condition` holds.
+    fn abortIf(condition: bool, status: int, message: string = "") { if (condition) { throw new HttpException(status, message); } }
+    fn abortUnless(condition: bool, status: int, message: string = "") { if (!condition) { throw new HttpException(status, message); } }
+}
