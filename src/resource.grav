@@ -1,0 +1,152 @@
+// resource.grav — API resources: how a model (or anything) looks in a JSON
+// API, kept apart from the model itself; collections of them, and pages.
+//
+//   class UserResource extends JsonResource {
+//       fn toArray(req: Request) -> HashMap<string, any> {
+//           let u = self.resource as User
+//           return self.fields()
+//               .add("id", u.id)
+//               .add("name", u.name)
+//               .when(req.user != null && (req.user as User).isAdmin(), "email", u.email)
+//               .whenNotNull("avatar", u.avatarUrl)
+//               .build()
+//       }
+//   }
+//   return new UserResource(user).toResponse(req)                       // {"data": {...}}
+//   return ResourceCollection.of(users, fn(u: any) -> JsonResource { return new UserResource(u) }).toResponse(req)
+//   return ResourceCollection.paged(page, fn(u: any) -> JsonResource { ... }).toResponse(req)   // data, meta, links
+import "std"
+import "request.grav"
+import "response.grav"
+import "json.grav"
+
+namespace apogee {
+
+    // Builds a resource's fields, with conditional ones.
+    class Fields {
+        private m: HashMap<string, any>
+        private order: Array<string>
+        constructor() { self.m = new HashMap<string, any>(); self.order = new Array<string>(); }
+        fn add(key: string, value: any) -> Fields {
+            if (!self.m.containsKey(key)) { self.order.push(key); }
+            self.m.put(key, value);
+            return self;
+        }
+        fn when(condition: bool, key: string, value: any) -> Fields { return condition ? self.add(key, value) : self; }
+        // (`make` only runs when the condition holds: for values that cost something.)
+        fn whenLazy(condition: bool, key: string, make: fn() -> any) -> Fields { return condition ? self.add(key, make()) : self; }
+        fn whenNotNull(key: string, value: any) -> Fields { return value != null ? self.add(key, value) : self; }
+        // Every pair of `values` when `condition` holds.
+        fn mergeWhen(condition: bool, values: HashMap<string, any>) -> Fields {
+            if (condition) { values.forEach(fn(k: string, v: any) { self.add(k, v); }); }
+            return self;
+        }
+        fn build() -> HashMap<string, any> { return self.m; }
+        fn keys() -> Array<string> { return self.order; }
+    }
+
+    abstract class JsonResource {
+        // What it presents (a model, a map, anything).
+        public resource: any
+        // The key a single resource's fields go under ("" for none).
+        public static wrapKey: string = "data"
+        constructor(resource: any) { self.resource = resource; }
+
+        abstract fn toArray(req: Request) -> HashMap<string, any>
+        // Members added at the top level of the response, next to "data".
+        fn with(req: Request) -> HashMap<string, any> { return null; }
+        // A fresh field builder.
+        fn fields() -> Fields { return new Fields(); }
+
+        fn resolve(req: Request) -> any { return self.toArray(req); }
+        fn toResponse(req: Request, status: int = 200) -> Response {
+            let body = new HashMap<string, any>();
+            let extra = self.with(req);
+            if (JsonResource.wrapKey == "") {
+                let own = self.toArray(req);
+                if (extra != null) { extra.forEach(fn(k: string, v: any) { own.put(k, v); }); }
+                return Response.json(own, status);
+            }
+            body.put(JsonResource.wrapKey, self.toArray(req));
+            if (extra != null) { extra.forEach(fn(k: string, v: any) { body.put(k, v); }); }
+            return Response.json(body, status);
+        }
+    }
+
+    // A page of results: the items, and where they sit in the whole.
+    class Paginator {
+        public items: Array<any>
+        public total: long
+        public perPage: int
+        public currentPage: int
+        // The page's URL without its page query ("/users?sort=name").
+        public path: string
+        constructor(items: Array<any>, total: long, perPage: int, currentPage: int, path: string = "") {
+            self.items = items; self.total = total; self.perPage = perPage < 1 ? 1 : perPage;
+            self.currentPage = currentPage < 1 ? 1 : currentPage; self.path = path;
+        }
+        fn lastPage() -> int { let n = ((self.total + self.perPage - 1) / self.perPage) as int; return n < 1 ? 1 : n; }
+        fn hasMore() -> bool { return self.currentPage < self.lastPage(); }
+        fn from() -> long { return self.items.size() == 0 ? 0 : ((self.currentPage - 1) as long) * self.perPage + 1; }
+        fn to() -> long { return self.items.size() == 0 ? 0 : self.from() + self.items.size() - 1; }
+        fn url(page: int) -> string {
+            let sep = Str.contains(self.path, "?") ? "&" : "?";
+            return self.path + sep + "page=${page}";
+        }
+        fn meta() -> HashMap<string, any> {
+            let m = new HashMap<string, any>();
+            m.put("current_page", self.currentPage);
+            m.put("per_page", self.perPage);
+            m.put("total", self.total);
+            m.put("last_page", self.lastPage());
+            m.put("from", self.from());
+            m.put("to", self.to());
+            return m;
+        }
+        fn links() -> HashMap<string, any> {
+            let l = new HashMap<string, any>();
+            l.put("first", self.url(1));
+            l.put("last", self.url(self.lastPage()));
+            l.put("prev", self.currentPage > 1 ? self.url(self.currentPage - 1) as any : null);
+            l.put("next", self.hasMore() ? self.url(self.currentPage + 1) as any : null);
+            return l;
+        }
+        // Page `page` of `all` (in memory).
+        static fn slice(all: Array<any>, perPage: int, page: int, path: string = "") -> Paginator {
+            let p = page < 1 ? 1 : page;
+            let start = (p - 1) * perPage;
+            let out = new Array<any>();
+            for (i in start..(start + perPage)) { if (i < all.size()) { out.push(all[i]); } }
+            return new Paginator(out, all.size() as long, perPage, p, path);
+        }
+    }
+
+    class ResourceCollection {
+        public items: Array<any>
+        private make: fn(any) -> JsonResource
+        private page: Paginator
+        constructor(items: Array<any>, make: fn(any) -> JsonResource) { self.items = items; self.make = make; self.page = null; }
+        static fn of(items: Array<any>, make: fn(any) -> JsonResource) -> ResourceCollection { return new ResourceCollection(items, make); }
+        // A page, with "meta" and "links" next to "data".
+        static fn paged(page: Paginator, make: fn(any) -> JsonResource) -> ResourceCollection {
+            let c = new ResourceCollection(page.items, make);
+            c.page = page;
+            return c;
+        }
+        fn resolve(req: Request) -> Array<any> {
+            let out = new Array<any>();
+            out.reserve(self.items.size());
+            for (x in self.items) { out.push(self.make(x).toArray(req)); }
+            return out;
+        }
+        fn toResponse(req: Request, status: int = 200) -> Response {
+            let body = new HashMap<string, any>();
+            body.put("data", self.resolve(req));
+            if (self.page != null) {
+                body.put("meta", self.page.meta());
+                body.put("links", self.page.links());
+            }
+            return Response.json(body, status);
+        }
+    }
+}
