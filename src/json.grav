@@ -156,6 +156,38 @@ namespace apogee {
             return out;
         }
         static fn parse(text: string) -> any { return Plain.fromJson(Json.parse(text)); }
+        // Every value a path with `*` wildcards reaches ("items.*.price": each
+        // item's price; a missing one is null), in order.
+        static fn digAll(v: any, path: string) -> Array<any> {
+            let out = new Array<any>();
+            Plain.collect(v, Str.split(path, "."), 0, out);
+            return out;
+        }
+        private static fn collect(cur: any, parts: Array<string>, i: int, out: Array<any>) {
+            if (i == parts.size()) { out.push(cur); return; }
+            let part = parts[i];
+            if (part == "*") {
+                if (cur is Array<any>) { for (x in cur as Array<any>) { Plain.collect(x, parts, i + 1, out); } }
+                else if (cur is HashMap<string, any>) {
+                    let keys = (cur as HashMap<string, any>).keys();
+                    Sort.sort(keys);
+                    for (k in keys) { Plain.collect((cur as HashMap<string, any>)[k], parts, i + 1, out); }
+                }
+                return;
+            }
+            Plain.collect(Plain.dig(cur, part), parts, i + 1, out);
+        }
+        // Sets a dotted path in nested maps, making the maps along it.
+        static fn setPath(m: HashMap<string, any>, path: string, value: any) {
+            let parts = Str.split(path, ".");
+            let node = m;
+            for (i in 0..(parts.size() - 1)) {
+                let next = node.getOr(parts[i], null);
+                if (!(next is HashMap<string, any>)) { next = new HashMap<string, any>(); node.put(parts[i], next); }
+                node = next as HashMap<string, any>;
+            }
+            node.put(parts[parts.size() - 1], value);
+        }
         // The value at a dotted path in nested maps and arrays ("user.tags.0").
         static fn dig(v: any, path: string) -> any {
             let cur = v;
