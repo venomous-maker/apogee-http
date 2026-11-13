@@ -14,6 +14,8 @@ import "std"
 import "std/net"
 import "apogee-container"
 import "json.grav"
+import "negotiation.grav"
+import "response.grav"
 
 namespace apogee {
 
@@ -54,6 +56,17 @@ namespace apogee {
         }
     }
 
+    // A session that keeps the last request's input for the next one (old()).
+    interface OldInputStore {
+        fn oldInput(key: string) -> any
+        fn flashInput(values: HashMap<string, any>)
+    }
+
+    // An object that validates itself once the container has made it (a form request).
+    interface ValidatesWhenResolved {
+        fn validateResolved()
+    }
+
     class Request {
         // The request as it arrived.
         public http: HttpRequest
@@ -71,6 +84,11 @@ namespace apogee {
         public session: any
         // Honour a `_method` form field (or X-HTTP-Method-Override header) on POST.
         public static methodOverride: bool = true
+        // Proxies whose X-Forwarded-* headers are believed ("10.0.0.1", "10.0.*", "*").
+        public static trustedProxies: Array<string> = new Array<string>()
+        // What validate() runs (installed by apogee-validation):
+        // (request, data, rules, messages, attributes) -> the validated data.
+        public static validator: fn(Request, HashMap<string, any>, HashMap<string, any>, HashMap<string, string>, HashMap<string, string>) -> HashMap<string, any> = null
 
         private attrs: HashMap<string, any>
         private inputs: HashMap<string, any>
@@ -141,27 +159,97 @@ namespace apogee {
             for (x in patterns) { if (Request.glob(x, self.routeName)) { return true; } }
             return false;
         }
-        fn scheme() -> string { return self.http.scheme; }
+        // Whether the connection came from a trusted proxy (whose forwarded headers count).
+        fn isFromTrustedProxy() -> bool { return TrustedProxies.trusts(Request.trustedProxies, self.http.remote); }
+        // "http" or "https" (X-Forwarded-Proto from a trusted proxy).
+        fn scheme() -> string {
+            if (self.isFromTrustedProxy()) {
+                let p = Str.lower(Str.trim(Str.split(self.http.header("X-Forwarded-Proto"), ",")[0]));
+                if (p == "http" || p == "https") { return p; }
+            }
+            return self.http.scheme;
+        }
+        fn isSecure() -> bool { return self.scheme() == "https"; }
+        // The Host header (or a trusted proxy's X-Forwarded-Host), port included.
+        fn httpHost() -> string {
+            if (self.isFromTrustedProxy()) {
+                let h = Str.trim(Str.split(self.http.header("X-Forwarded-Host"), ",")[0]);
+                if (h != "") { return h; }
+            }
+            return self.http.host();
+        }
+        // The host name without its port.
         fn host() -> string {
-            let h = self.http.host();
+            let h = self.httpHost();
             let colon = Str.lastIndexOf(h, ":");
             return colon > 0 && Str.indexOf(h, "]") < colon ? h[..colon] : h;
         }
-        // "https://example.com" (the Host header as given).
-        fn root() -> string { return self.http.scheme + "://" + self.http.host(); }
+        // The port the client asked for (from the Host header, else the scheme's).
+        fn port() -> int {
+            let h = self.httpHost();
+            let colon = Str.lastIndexOf(h, ":");
+            if (colon > 0 && Str.indexOf(h, "]") < colon) { return Format.toIntOr(h[colon + 1..], 0); }
+            return self.isSecure() ? 443 : 80;
+        }
+        // "https://example.com" (scheme and host, port included).
+        fn root() -> string { return self.scheme() + "://" + self.httpHost(); }
+        fn schemeAndHttpHost() -> string { return self.root(); }
         // The URL without its query string.
         fn url() -> string { return self.root() + self.path(); }
         // The URL with its query string.
         fn fullUrl() -> string { return self.root() + self.http.target; }
+        // The full URL with `values` added to (or replacing in) its query.
+        fn fullUrlWithQuery(values: HashMap<string, any>) -> string {
+            let q = new HashMap<string, string>();
+            self.http.queryParams().forEach(fn(k: string, v: string) { q.put(k, v); });
+            values.forEach(fn(k: string, v: any) { q.put(k, v is string ? v as string : str(v)); });
+            return self.url() + Request.queryText(q);
+        }
+        // The full URL without the query fields `keys`.
+        fn fullUrlWithoutQuery(keys: Array<string>) -> string {
+            let q = new HashMap<string, string>();
+            self.http.queryParams().forEach(fn(k: string, v: string) { if (!keys.contains(k)) { q.put(k, v); } });
+            return self.url() + Request.queryText(q);
+        }
+        private static fn queryText(q: HashMap<string, string>) -> string {
+            if (q.size() == 0) { return ""; }
+            let keys = q.keys();
+            Sort.sort(keys);
+            let parts = new Array<string>();
+            for (k in keys) { parts.push(Url.encode(k) + "=" + Url.encode(q[k])); }
+            return "?" + Str.join(parts, "&");
+        }
         fn queryString() -> string { return self.http.queryString(); }
+        // A stable id for this request's route and client (sha1 of method, URL and IP).
+        fn fingerprint() -> string { return Hash.sha1(self.method() + "|" + self.root() + self.path() + "|" + self.ip()); }
 
         // ── who is asking, and what for ────────────────────────────────────────
         fn header(name: string, fallback: string = "") -> string { let v = self.http.header(name); return v == "" ? fallback : v; }
         fn hasHeader(name: string) -> bool { return self.http.headers.has(name); }
         fn bearerToken() -> string { return self.http.bearerToken(); }
-        fn ip() -> string { return self.http.ip(); }
+        // HTTP basic credentials: [user, password], or empty.
+        fn basicCredentials() -> Array<string> { return self.http.basicAuth(); }
+        // The client's address: the connection's, or (from a trusted proxy) the
+        // nearest address in X-Forwarded-For that is not itself a trusted proxy.
+        fn ip() -> string {
+            let chain = self.ips();
+            return chain.size() > 0 ? chain[0] : TrustedProxies.hostOf(self.http.remote);
+        }
+        // Every client address, the client first (X-Forwarded-For through trusted proxies).
+        fn ips() -> Array<string> {
+            let out = new Array<string>();
+            let direct = TrustedProxies.hostOf(self.http.remote);
+            if (!self.isFromTrustedProxy()) { out.push(direct); return out; }
+            let hops = new Array<string>();
+            for (p in Str.split(self.http.header("X-Forwarded-For"), ",")) { let t = Str.trim(p); if (t != "") { hops.push(TrustedProxies.hostOf(t)); } }
+            hops.push(direct);
+            // From the nearest hop back, skip trusted proxies: the first other one is the client.
+            let i = hops.size() - 1;
+            while (i > 0 && TrustedProxies.trusts(Request.trustedProxies, hops[i])) { i -= 1; }
+            for (j in 0..(i + 1)) { out.push(hops[i - j]); }
+            return out;
+        }
         fn userAgent() -> string { return self.http.userAgent(); }
-        fn isSecure() -> bool { return self.http.isSecure(); }
         // Sent by fetch()/XMLHttpRequest libraries.
         fn ajax() -> bool { return Str.lower(self.http.header("X-Requested-With")) == "xmlhttprequest"; }
         // Whether the client prefers JSON over HTML.
@@ -171,7 +259,37 @@ namespace apogee {
         }
         // Whether an answer should be JSON: the client wants it, or sent JSON, or is XHR.
         fn expectsJson() -> bool { return self.wantsJson() || self.http.isJson() || (self.ajax() && !Str.contains(Str.lower(self.http.header("Accept")), "text/html")); }
-        fn accepts(mime: string) -> bool { return self.http.accepts(mime); }
+        // The Accept header's media ranges, best first.
+        fn acceptableContentTypes() -> Array<string> {
+            let out = new Array<string>();
+            for (r in AcceptHeader.parse(self.http.header("Accept"))) { out.push(r.mime); }
+            return out;
+        }
+        // Whether the client accepts `mime` ("json" and "html" work as short names).
+        fn accepts(mime: string) -> bool { return AcceptHeader.quality(AcceptHeader.parse(self.http.header("Accept")), AcceptHeader.expand(mime)) > 0.0; }
+        fn acceptsJson() -> bool { return self.accepts("json"); }
+        fn acceptsHtml() -> bool { return self.accepts("html"); }
+        fn acceptsAnyContentType() -> bool {
+            let a = Str.trim(self.http.header("Accept"));
+            return a == "" || Str.contains(a, "*/*") || a == "*";
+        }
+        // Of `offered` ("json", "html", "text/csv", ...), the one the client likes best ("" for none).
+        fn prefers(offered: Array<string>) -> string { return AcceptHeader.prefer(AcceptHeader.parse(self.http.header("Accept")), offered); }
+        // "json" or "html": what to answer in when the client does not say.
+        fn format(fallback: string = "html") -> string {
+            let p = self.prefers(["json", "html"]);
+            return p == "" ? fallback : p;
+        }
+        fn isJson() -> bool { return self.http.isJson(); }
+        // A PJAX request (X-PJAX), or a browser prefetching (Purpose/Sec-Purpose: prefetch).
+        fn pjax() -> bool { return self.http.header("X-PJAX") != ""; }
+        fn prefetch() -> bool {
+            return Str.contains(Str.lower(self.http.header("Purpose")), "prefetch") || Str.contains(Str.lower(self.http.header("Sec-Purpose")), "prefetch");
+        }
+        // The raw body.
+        fn content() -> string { return self.http.body(); }
+        fn contentType() -> string { return self.http.contentType(); }
+        fn hasCookie(name: string) -> bool { return self.cookies().containsKey(name); }
         // The cookies the client sent (parsed once).
         fn cookies() -> HashMap<string, string> {
             if (self.cookieMap == null) { self.cookieMap = self.http.cookies(); }
@@ -213,15 +331,41 @@ namespace apogee {
             return m;
         }
         // An input value by name or dotted path ("user.name", "items.0.id"), or `fallback`.
+        // A path with `*` ("items.*.price") gives an Array<any> of every match.
         fn input(key: string, fallback: any = null) -> any {
             let m = self.all();
             if (m.containsKey(key)) { return m[key]; }
             if (Str.indexOf(key, ".") < 0) { return fallback; }
+            if (Str.indexOf(key, "*") >= 0) { return Plain.digAll(m, key); }
             let v = Plain.dig(m, key);
             return v == null ? fallback : v;
         }
-        fn has(key: string) -> bool { return self.input(key) != null; }
+        // Whether the input has `key` (null values count as present, as a JSON null was sent).
+        fn has(key: string) -> bool {
+            let m = self.all();
+            if (m.containsKey(key)) { return true; }
+            if (Str.indexOf(key, ".") < 0) { return false; }
+            let dot = Str.lastIndexOf(key, ".");
+            let parent = Plain.dig(m, key[..dot]);
+            if (parent is HashMap<string, any>) { return (parent as HashMap<string, any>).containsKey(key[dot + 1..]); }
+            return Plain.dig(m, key) != null;
+        }
+        fn exists(key: string) -> bool { return self.has(key); }
+        // Whether every one of `keys` is present.
+        fn hasAll(keys: Array<string>) -> bool { for (k in keys) { if (!self.has(k)) { return false; } } return true; }
         fn hasAny(keys: Array<string>) -> bool { for (k in keys) { if (self.has(k)) { return true; } } return false; }
+        fn anyFilled(keys: Array<string>) -> bool { for (k in keys) { if (self.filled(k)) { return true; } } return false; }
+        fn isNotFilled(key: string) -> bool { return !self.filled(key); }
+        // Runs `f` with the value when `key` is present; returns the request (calls chain).
+        fn whenHas(key: string, f: fn(any)) -> Request { if (self.has(key)) { f(self.input(key)); } return self; }
+        // Runs `f` with the value when `key` is filled, else `otherwise` (when given).
+        fn whenFilled(key: string, f: fn(any), otherwise: fn() = null) -> Request {
+            if (self.filled(key)) { f(self.input(key)); } else if (otherwise != null) { otherwise(); }
+            return self;
+        }
+        fn whenMissing(key: string, f: fn()) -> Request { if (!self.has(key)) { f(); } return self; }
+        // The top-level input names.
+        fn keys() -> Array<string> { let k = self.all().keys(); Sort.sort(k); return k; }
         // Present and not empty (not "", not whitespace only, not an empty list).
         fn filled(key: string) -> bool {
             let v = self.input(key);
@@ -263,9 +407,16 @@ namespace apogee {
             return false;
         }
         // A date ("2026-11-14" or "2026-11-14 09:30:00"), or null.
-        fn date(key: string) -> DateTime {
+        fn date(key: string, format: string = "") -> DateTime {
             let s = self.text(key);
-            return s == "" ? null : DateTime.tryParse(s);
+            if (s == "") { return null; }
+            if (format == "") { return DateTime.tryParse(s); }
+            try { return DateTime.parse(s, format); } catch (e: Exception) { return null; }
+        }
+        // A map input (a JSON object), or an empty map.
+        fn map(key: string) -> HashMap<string, any> {
+            let v = self.input(key);
+            return v is HashMap<string, any> ? v as HashMap<string, any> : new HashMap<string, any>();
         }
         // A list input: a JSON array, or the comma-separated values of a text one.
         fn list(key: string) -> Array<any> {
@@ -277,9 +428,15 @@ namespace apogee {
             } else if (v != null) { out.push(v); }
             return out;
         }
+        // The named inputs that are present; a dotted name keeps its nesting
+        // ("user.name" gives {"user": {"name": ...}}).
         fn only(keys: Array<string>) -> HashMap<string, any> {
             let out = new HashMap<string, any>();
-            for (k in keys) { let v = self.input(k); if (v != null) { out.put(k, v); } }
+            for (k in keys) {
+                if (!self.has(k)) { continue; }
+                if (Str.indexOf(k, ".") >= 0 && Str.indexOf(k, "*") < 0) { Plain.setPath(out, k, self.input(k)); }
+                else { out.put(k, self.input(k)); }
+            }
             return out;
         }
         fn except(keys: Array<string>) -> HashMap<string, any> {
@@ -291,10 +448,31 @@ namespace apogee {
         }
         // Adds (or replaces) input values, as if the client had sent them.
         fn merge(values: HashMap<string, any>) { let m = self.all(); values.forEach(fn(k: string, v: any) { m.put(k, v); }); }
+        // Adds only the values whose names the input does not have yet.
+        fn mergeIfMissing(values: HashMap<string, any>) {
+            let m = self.all();
+            values.forEach(fn(k: string, v: any) { if (!m.containsKey(k)) { m.put(k, v); } });
+        }
+        // Replaces the whole input with `values`.
+        fn replace(values: HashMap<string, any>) {
+            let m = new HashMap<string, any>();
+            values.forEach(fn(k: string, v: any) { m.put(k, v); });
+            self.inputs = m;
+        }
+        // A body value only (not the query string).
+        fn post(key: string, fallback: any = null) -> any {
+            let body = self.json();
+            if (body is HashMap<string, any>) { let v = Plain.dig(body, key); return v == null ? fallback : v; }
+            let v = self.http.formValue(key);
+            return v == "" ? fallback : v as any;
+        }
+        // Every query-string field.
+        fn queryAll() -> HashMap<string, string> { return self.http.queryParams(); }
+        fn hasQuery(key: string) -> bool { return self.http.hasQuery(key); }
         fn query(key: string, fallback: string = "") -> string { let v = self.http.query(key); return v == "" ? fallback : v; }
 
         // ── files ──────────────────────────────────────────────────────────────
-        fn file(name: string) -> UploadedFile {
+        fn file(name: string) -> UploadedFile {    // ("" just parses them)
             if (self.files == null) {
                 self.files = new HashMap<string, UploadedFile>();
                 for (p in self.http.files()) { if (!self.files.containsKey(p.name)) { self.files.put(p.name, new UploadedFile(p)); } }
@@ -302,6 +480,58 @@ namespace apogee {
             return self.files.getOr(name, null);
         }
         fn hasFile(name: string) -> bool { return self.file(name) != null; }
+        // Every uploaded file (the first per field name).
+        fn allFiles() -> Array<UploadedFile> {
+            self.file("");
+            let out = new Array<UploadedFile>();
+            let names = self.files.keys();
+            Sort.sort(names);
+            for (n in names) { out.push(self.files[n]); }
+            return out;
+        }
+
+        // ── the previous request's input (needs a session) ─────────────────────
+        // What the previous request sent for `key` (flashed when it failed
+        // validation), to refill a form; `fallback` without a session.
+        fn old(key: string, fallback: any = null) -> any {
+            if (!(self.session is OldInputStore)) { return fallback; }
+            let v = (self.session as OldInputStore).oldInput(key);
+            return v == null ? fallback : v;
+        }
+        // Keeps this request's input for the next request's old().
+        fn flash() { self.flashValues(self.all()); }
+        fn flashOnly(keys: Array<string>) { self.flashValues(self.only(keys)); }
+        fn flashExcept(keys: Array<string>) { self.flashValues(self.except(keys)); }
+        private fn flashValues(values: HashMap<string, any>) {
+            if (self.session is OldInputStore) { (self.session as OldInputStore).flashInput(values); }
+        }
+
+        // ── validation (with apogee-validation) ────────────────────────────────
+        // Validates the input against `rules` ("email": "required|email|max:255"
+        // or a list of rules); the validated data, or a ValidationException
+        // (a 422 for JSON clients; a redirect back with errors and old input otherwise).
+        fn validate(rules: HashMap<string, any>, messages: HashMap<string, string> = new HashMap<string, string>(),
+                    attributes: HashMap<string, string> = new HashMap<string, string>()) -> HashMap<string, any> {
+            if (Request.validator == null) { throw new StateError("validate() needs apogee-validation: import it"); }
+            let run = Request.validator;
+            let data = run(self, self.all(), rules, messages, attributes);
+            self.set("apogee.validated", data);
+            return data;
+        }
+        // What the last validate() passed (an empty map before one).
+        fn validated() -> HashMap<string, any> {
+            let v = self.get("apogee.validated");
+            return v is HashMap<string, any> ? v as HashMap<string, any> : new HashMap<string, any>();
+        }
+
+        // ── the route ──────────────────────────────────────────────────────────
+        // A route value: the model the router bound for it, else its text.
+        fn route(name: string) -> any {
+            let bound = self.get(name);
+            return bound != null ? bound : self.http.param(name) as any;
+        }
+        // The signed-in user as a T (null for a guest).
+        fn userAs<T>() -> T { return self.user == null ? null : self.user as T; }
 
         // ── attributes (what middleware leaves for later) ──────────────────────
         fn set(key: string, value: any) { if (self.attrs == null) { self.attrs = new HashMap<string, any>(); } self.attrs.put(key, value); }
