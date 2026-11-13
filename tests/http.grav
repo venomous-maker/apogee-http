@@ -181,3 +181,87 @@ test "the JSON writer: escapes, objects, nesting" {
     let nested = Plain.parse(JsonWriter.encode(outer)) as HashMap<string, any>
     assertEq(JsonWriter.encode(nested), "{\"a\":{\"b\":[true,false]}}")
 }
+
+test "Request: wildcards, presence, nested only, conditional helpers, merging" {
+    let r = Request.make("POST", "/orders?ref=ad", "{\"items\": [{\"sku\": \"a\", \"qty\": 2}, {\"sku\": \"b\", \"qty\": 5}], \"note\": null, \"user\": {\"name\": \"Ada\", \"email\": \"ada@x.io\"}}", "application/json")
+    let skus = r.input("items.*.sku") as Array<any>
+    assertEq("${skus.size()} ${skus[0]} ${skus[1]}", "2 a b")
+    assertEq(r.has("note"), true)                                       // sent as null: present
+    assertEq(r.filled("note"), false)
+    assertEq(r.has("user.email"), true)
+    assertEq(r.hasAll(["ref", "user.name"]), true)
+    assertEq(r.anyFilled(["note", "ref"]), true)
+    let picked = r.only(["user.name", "ref"])
+    assertEq("${(picked["user"] as HashMap<string, any>)["name"]} ${picked["ref"]} ${(picked["user"] as HashMap<string, any>).containsKey("email")}", "Ada ad false")
+    let seen = new Array<string>()
+    r.whenFilled("ref", fn(v: any) { seen.push("ref=${v}") })
+     .whenFilled("note", fn(v: any) { seen.push("note") }, fn() { seen.push("no note") })
+     .whenHas("missing", fn(v: any) { seen.push("never") })
+     .whenMissing("coupon", fn() { seen.push("no coupon") })
+    assertEq(Str.join(seen, ","), "ref=ad,no note,no coupon")
+    r.mergeIfMissing({"ref": "other" as any, "source": "web" as any})
+    assertEq("${r.text("ref")} ${r.text("source")}", "ad web")
+    assertEq(r.post("ref") == null, true)                               // the query string is not the body
+    assertEq(r.post("user.name") as string, "Ada")
+    assertEq(Str.join(r.keys(), ","), "items,note,ref,source,user")
+    r.replace({"only": 1 as any})
+    assertEq(Str.join(r.keys(), ","), "only")
+    let d = Request.make("GET", "/?when=14/11/2026")
+    assertEq(d.date("when", "%d/%m/%Y").year(), 2026)
+    assertEq(d.date("when") == null, true)                              // not ISO
+}
+
+test "Request: URLs, proxies and client addresses" {
+    let r = Request.make("GET", "/search?q=grav&page=2")
+    r.http.remote = "10.0.0.5:4431"
+    r.http.headers.set("X-Forwarded-For", "203.0.113.7, 10.0.0.9")
+    r.http.headers.set("X-Forwarded-Proto", "https")
+    r.http.headers.set("X-Forwarded-Host", "shop.example.com")
+    assertEq("${r.ip()} ${r.scheme()} ${r.host()}", "10.0.0.5 http localhost")   // no trusted proxies: headers ignored
+    Request.trustedProxies.push("10.0.*")
+    assertEq("${r.ip()} ${Str.join(r.ips(), ",")} ${r.isSecure()} ${r.root()} ${r.port()}",
+             "203.0.113.7 203.0.113.7 true https://shop.example.com 443")
+    assertEq(r.fullUrlWithQuery({"page": 3 as any}), "https://shop.example.com/search?page=3&q=grav")
+    assertEq(r.fullUrlWithoutQuery(["page"]), "https://shop.example.com/search?q=grav")
+    assertEq(r.fingerprint().length, 40)
+    Request.trustedProxies.clear()
+}
+
+test "Request: content negotiation by quality" {
+    let r = Request.make("GET", "/")
+    r.http.headers.set("Accept", "text/html;q=0.8, application/json, */*;q=0.1")
+    assertEq(r.prefers(["html", "json"]), "json")
+    assertEq(r.accepts("text/csv"), true)                               // via */*
+    assertEq(r.acceptsHtml(), true)
+    assertEq(r.format(), "json")
+    assertEq(Str.join(r.acceptableContentTypes(), ","), "application/json,text/html,*/*")
+    let none = Request.make("GET", "/")
+    none.http.headers.set("Accept", "image/png")
+    assertEq("${none.prefers(["json", "html"]) == ""} ${none.acceptsJson()} ${none.acceptsAnyContentType()}", "true false false")
+}
+
+class MemoryOld implements OldInputStore {
+    public flashed: HashMap<string, any> = new HashMap<string, any>()
+    fn oldInput(key: string) -> any { return self.flashed.getOr(key, null) }
+    fn flashInput(values: HashMap<string, any>) { self.flashed = values }
+}
+
+test "Request: old input through a session, route values, the user" {
+    let store = new MemoryOld()
+    let r = Request.make("POST", "/signup", "email=ada%40x.io&password=secret", "application/x-www-form-urlencoded")
+    r.session = store
+    r.flashExcept(["password"])
+    let next = Request.make("GET", "/signup")
+    next.session = store
+    assertEq("${next.old("email")} ${next.old("password", "-")}", "ada@x.io -")
+    assertEq(Request.make("GET", "/").old("email", "none") as string, "none")
+    r.http.setParam("id", "7")
+    assertEq(r.route("id") as string, "7")
+    r.set("id", new MemoryOld())
+    assertEq(r.route("id") is MemoryOld, true)                          // a bound model wins
+    r.user = store
+    assertEq(r.userAs::<MemoryOld>() == store, true)
+    let msg = ""
+    try { r.validate({"email": "required" as any}) } catch (e: StateError) { msg = e.message() }
+    assertEq(msg, "validate() needs apogee-validation: import it")
+}
