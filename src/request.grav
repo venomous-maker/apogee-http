@@ -1,0 +1,321 @@
+// request.grav — Request: one HTTP request as an application sees it: its
+// input (query, form and JSON body merged, typed, by dotted path), route
+// values, files, cookies, who is asking, and what it accepts. Every parse
+// happens at most once per request, on first use.
+//
+//   req.input("user.name")                 // from a JSON body, a form or the query string
+//   req.integer("page", 1)
+//   req.boolean("remember")                // "1", "true", "on", "yes"
+//   req.only(["email", "name"])
+//   req.param("id")                        // a route value
+//   req.file("avatar").store("uploads")    // an uploaded file
+//   req.expectsJson()                      // API client, or XHR
+import "std"
+import "std/net"
+import "apogee-container"
+import "json.grav"
+
+namespace apogee {
+
+    // A file uploaded in a multipart form.
+    class UploadedFile {
+        public part: FormPart
+        constructor(part: FormPart) { self.part = part; }
+        // The form field's name.
+        fn field() -> string { return self.part.name; }
+        // The file name the client gave, without any directory part.
+        fn clientName() -> string {
+            let n = self.part.filename;
+            let slash = Str.lastIndexOf(n, "/");
+            let back = Str.lastIndexOf(n, "\\");
+            let cut = slash > back ? slash : back;
+            return cut >= 0 ? n[cut + 1..] : n;
+        }
+        // The extension of the client's name, lower case, without the dot ("" for none).
+        fn extension() -> string {
+            let n = self.clientName();
+            let dot = Str.lastIndexOf(n, ".");
+            return dot > 0 ? Str.lower(n[dot + 1..]) : "";
+        }
+        fn mimeType() -> string { return self.part.contentType; }
+        fn size() -> int { return self.part.size(); }
+        fn bytes() -> Bytes { return self.part.data; }
+        fn text() -> string { return self.part.text(); }
+        // Saves it under `dir` as `name` (a random name with its extension when
+        // ""); the path written.
+        fn store(dir: string, name: string = "") -> string {
+            if (!Dir.exists(dir) && !Dir.create(dir)) { throw new IOError("cannot create '${dir}'"); }
+            let ext = self.extension();
+            let file = name != "" ? name : Hash.randomToken(16) + (ext != "" ? "." + ext : "");
+            if (Str.contains(file, "/") || Str.contains(file, "..")) { throw new ValueError("not a plain file name: " + file); }
+            let path = dir + "/" + file;
+            if (!new File(path).writeBinary(self.part.data.toBinary())) { throw new IOError("cannot write '${path}'"); }
+            return path;
+        }
+    }
+
+    class Request {
+        // The request as it arrived.
+        public http: HttpRequest
+        // The per-request scope of the application's container (null without one).
+        public container: Container
+        // The matched route's name ("" when unnamed, or before routing).
+        public routeName: string
+        // The authenticated user, once a guard has found one (null for a guest).
+        public user: any
+        // The session, once a session middleware has started one.
+        public session: any
+        // Honour a `_method` form field (or X-HTTP-Method-Override header) on POST.
+        public static methodOverride: bool = true
+
+        private attrs: HashMap<string, any>
+        private inputs: HashMap<string, any>
+        private bodyValue: any
+        private bodyParsed: bool
+        private cookieMap: HashMap<string, string>
+        private files: HashMap<string, UploadedFile>
+        private methodName: string
+
+        constructor(http: HttpRequest) {
+            self.http = http;
+            self.container = null;
+            self.routeName = "";
+            self.user = null;
+            self.session = null;
+            self.attrs = null; self.inputs = null; self.bodyValue = null; self.bodyParsed = false;
+            self.cookieMap = null; self.files = null; self.methodName = "";
+        }
+        // A request made up in code (tests, internal sub-requests).
+        static fn make(method: string, target: string, body: string = "", contentType: string = "") -> Request {
+            let h = new HttpRequest(method, target, "HTTP/1.1");
+            if (body != "") { h.bodyBytes = Bytes.fromString(body); }
+            if (contentType != "") { h.headers.set("Content-Type", contentType); }
+            h.headers.set("Host", "localhost");
+            return new Request(h);
+        }
+
+        // ── the request line ───────────────────────────────────────────────────
+        // The method, upper case; a POST can stand for PUT/PATCH/DELETE through a
+        // `_method` field or the X-HTTP-Method-Override header.
+        fn method() -> string {
+            if (self.methodName != "") { return self.methodName; }
+            let m = self.http.method;
+            if (m == "POST" && Request.methodOverride) {
+                let o = self.http.header("X-HTTP-Method-Override");
+                if (o == "" && !self.http.isJson()) { o = self.text("_method"); }
+                let up = Str.upper(Str.trim(o));
+                if (up == "PUT" || up == "PATCH" || up == "DELETE") { m = up; }
+            }
+            self.methodName = m;
+            return m;
+        }
+        fn isMethod(m: string) -> bool { return self.method() == Str.upper(m); }
+        // The decoded path, always starting with "/" ("/users/7").
+        fn path() -> string { return self.http.path == "" ? "/" : self.http.path; }
+        // The path's segments ("/users/7" gives "users", "7").
+        fn segments() -> Array<string> {
+            let out = new Array<string>();
+            for (p in Str.split(self.path(), "/")) { if (p != "") { out.push(p); } }
+            return out;
+        }
+        // Segment `i` (1-based, as `segment(1)` of "/users/7" is "users"), or "".
+        fn segment(i: int, fallback: string = "") -> string {
+            let s = self.segments();
+            return i >= 1 && i <= s.size() ? s[i - 1] : fallback;
+        }
+        // Whether the path matches one of `patterns` ("admin/*", "users/*/edit"; no leading slash needed).
+        fn pathIs(patterns: Array<string>) -> bool {
+            let p = self.path()[1..];
+            for (x in patterns) { if (Request.glob(Str.startsWith(x, "/") ? x[1..] : x, p)) { return true; } }
+            return false;
+        }
+        // Whether the matched route's name matches one of `patterns` ("admin.*").
+        fn routeIs(patterns: Array<string>) -> bool {
+            for (x in patterns) { if (Request.glob(x, self.routeName)) { return true; } }
+            return false;
+        }
+        fn scheme() -> string { return self.http.scheme; }
+        fn host() -> string {
+            let h = self.http.host();
+            let colon = Str.lastIndexOf(h, ":");
+            return colon > 0 && Str.indexOf(h, "]") < colon ? h[..colon] : h;
+        }
+        // "https://example.com" (the Host header as given).
+        fn root() -> string { return self.http.scheme + "://" + self.http.host(); }
+        // The URL without its query string.
+        fn url() -> string { return self.root() + self.path(); }
+        // The URL with its query string.
+        fn fullUrl() -> string { return self.root() + self.http.target; }
+        fn queryString() -> string { return self.http.queryString(); }
+
+        // ── who is asking, and what for ────────────────────────────────────────
+        fn header(name: string, fallback: string = "") -> string { let v = self.http.header(name); return v == "" ? fallback : v; }
+        fn hasHeader(name: string) -> bool { return self.http.headers.has(name); }
+        fn bearerToken() -> string { return self.http.bearerToken(); }
+        fn ip() -> string { return self.http.ip(); }
+        fn userAgent() -> string { return self.http.userAgent(); }
+        fn isSecure() -> bool { return self.http.isSecure(); }
+        // Sent by fetch()/XMLHttpRequest libraries.
+        fn ajax() -> bool { return Str.lower(self.http.header("X-Requested-With")) == "xmlhttprequest"; }
+        // Whether the client prefers JSON over HTML.
+        fn wantsJson() -> bool {
+            let accept = Str.lower(self.http.header("Accept"));
+            return Str.contains(accept, "/json") || Str.contains(accept, "+json");
+        }
+        // Whether an answer should be JSON: the client wants it, or sent JSON, or is XHR.
+        fn expectsJson() -> bool { return self.wantsJson() || self.http.isJson() || (self.ajax() && !Str.contains(Str.lower(self.http.header("Accept")), "text/html")); }
+        fn accepts(mime: string) -> bool { return self.http.accepts(mime); }
+        // The cookies the client sent (parsed once).
+        fn cookies() -> HashMap<string, string> {
+            if (self.cookieMap == null) { self.cookieMap = self.http.cookies(); }
+            return self.cookieMap;
+        }
+        fn cookie(name: string, fallback: string = "") -> string { return self.cookies().getOr(name, fallback); }
+
+        // ── route values ───────────────────────────────────────────────────────
+        fn param(name: string, fallback: string = "") -> string { let v = self.http.param(name); return v == "" ? fallback : v; }
+        fn paramInt(name: string, fallback: long = 0) -> long { return Integer.parseOr(self.http.param(name), fallback); }
+
+        // ── input ──────────────────────────────────────────────────────────────
+        // The JSON body as plain values (null when it is not JSON, or empty).
+        fn json() -> any {
+            if (!self.bodyParsed) {
+                self.bodyParsed = true;
+                if (self.http.isJson() && self.http.bodyBytes.size() > 0) {
+                    try { self.bodyValue = Plain.parse(self.http.body()); }
+                    catch (e: Exception) { throw new HttpException(400, "the request body is not valid JSON"); }
+                }
+            }
+            return self.bodyValue;
+        }
+        // Every input value: the query string, then the body (a JSON object's
+        // members, or form fields) over it.
+        fn all() -> HashMap<string, any> {
+            if (self.inputs != null) { return self.inputs; }
+            let m = new HashMap<string, any>();
+            self.http.queryParams().forEach(fn(k: string, v: string) { m.put(k, v); });
+            let body = self.json();
+            if (body is HashMap<string, any>) { (body as HashMap<string, any>).forEach(fn(k: string, v: any) { m.put(k, v); }); }
+            else if (!self.http.isJson() && self.http.bodyBytes.size() > 0) {
+                let ct = self.http.contentType();
+                if (ct == "application/x-www-form-urlencoded" || ct == "multipart/form-data" || ct == "") {
+                    self.http.form().forEach(fn(k: string, v: string) { m.put(k, v); });
+                }
+            }
+            self.inputs = m;
+            return m;
+        }
+        // An input value by name or dotted path ("user.name", "items.0.id"), or `fallback`.
+        fn input(key: string, fallback: any = null) -> any {
+            let m = self.all();
+            if (m.containsKey(key)) { return m[key]; }
+            if (Str.indexOf(key, ".") < 0) { return fallback; }
+            let v = Plain.dig(m, key);
+            return v == null ? fallback : v;
+        }
+        fn has(key: string) -> bool { return self.input(key) != null; }
+        fn hasAny(keys: Array<string>) -> bool { for (k in keys) { if (self.has(k)) { return true; } } return false; }
+        // Present and not empty (not "", not whitespace only, not an empty list).
+        fn filled(key: string) -> bool {
+            let v = self.input(key);
+            if (v == null) { return false; }
+            if (v is string) { return Str.trim(v as string) != ""; }
+            if (v is Array<any>) { return (v as Array<any>).size() > 0; }
+            return true;
+        }
+        fn missing(key: string) -> bool { return !self.has(key); }
+        fn text(key: string, fallback: string = "") -> string {
+            let v = self.input(key);
+            if (v == null) { return fallback; }
+            return v is string ? v as string : str(v);
+        }
+        fn integer(key: string, fallback: long = 0) -> long {
+            let v = self.input(key);
+            if (v is long) { return v as long; }
+            if (v is double) { return (v as double) as long; }
+            if (v is string) { return Integer.parseOr(Str.trim(v as string), fallback); }
+            if (v is bool) { return (v as bool) ? 1 : 0; }
+            return fallback;
+        }
+        fn number(key: string, fallback: double = 0.0) -> double {
+            let v = self.input(key);
+            if (v is double) { return v as double; }
+            if (v is long) { return (v as long) as double; }
+            if (v is string) { return Format.toFloatOr(Str.trim(v as string), fallback); }
+            return fallback;
+        }
+        // true for true, 1, "1", "true", "on", "yes"; false otherwise.
+        fn boolean(key: string) -> bool {
+            let v = self.input(key);
+            if (v is bool) { return v as bool; }
+            if (v is long) { return (v as long) != 0; }
+            if (v is string) {
+                let s = Str.lower(Str.trim(v as string));
+                return s == "1" || s == "true" || s == "on" || s == "yes";
+            }
+            return false;
+        }
+        // A date ("2026-11-14" or "2026-11-14 09:30:00"), or null.
+        fn date(key: string) -> DateTime {
+            let s = self.text(key);
+            return s == "" ? null : DateTime.tryParse(s);
+        }
+        // A list input: a JSON array, or the comma-separated values of a text one.
+        fn list(key: string) -> Array<any> {
+            let v = self.input(key);
+            if (v is Array<any>) { return v as Array<any>; }
+            let out = new Array<any>();
+            if (v is string) {
+                for (p in Str.split(v as string, ",")) { let t = Str.trim(p); if (t != "") { out.push(t); } }
+            } else if (v != null) { out.push(v); }
+            return out;
+        }
+        fn only(keys: Array<string>) -> HashMap<string, any> {
+            let out = new HashMap<string, any>();
+            for (k in keys) { let v = self.input(k); if (v != null) { out.put(k, v); } }
+            return out;
+        }
+        fn except(keys: Array<string>) -> HashMap<string, any> {
+            let skip = new HashSet<string>();
+            for (k in keys) { skip.add(k); }
+            let out = new HashMap<string, any>();
+            self.all().forEach(fn(k: string, v: any) { if (!skip.contains(k)) { out.put(k, v); } });
+            return out;
+        }
+        // Adds (or replaces) input values, as if the client had sent them.
+        fn merge(values: HashMap<string, any>) { let m = self.all(); values.forEach(fn(k: string, v: any) { m.put(k, v); }); }
+        fn query(key: string, fallback: string = "") -> string { let v = self.http.query(key); return v == "" ? fallback : v; }
+
+        // ── files ──────────────────────────────────────────────────────────────
+        fn file(name: string) -> UploadedFile {
+            if (self.files == null) {
+                self.files = new HashMap<string, UploadedFile>();
+                for (p in self.http.files()) { if (!self.files.containsKey(p.name)) { self.files.put(p.name, new UploadedFile(p)); } }
+            }
+            return self.files.getOr(name, null);
+        }
+        fn hasFile(name: string) -> bool { return self.file(name) != null; }
+
+        // ── attributes (what middleware leaves for later) ──────────────────────
+        fn set(key: string, value: any) { if (self.attrs == null) { self.attrs = new HashMap<string, any>(); } self.attrs.put(key, value); }
+        fn get(key: string, fallback: any = null) -> any { return self.attrs == null ? fallback : self.attrs.getOr(key, fallback); }
+        fn hasAttribute(key: string) -> bool { return self.attrs != null && self.attrs.containsKey(key); }
+        // A service from the request's container scope.
+        fn make<T>() -> T {
+            if (self.container == null) { throw new StateError("this request has no container"); }
+            return self.container.make::<T>();
+        }
+
+        // "admin/*" against "admin/users": `*` matches any run of characters.
+        static fn glob(pattern: string, text: string) -> bool {
+            if (pattern == "*" || pattern == text) { return true; }
+            let star = Str.indexOf(pattern, "*");
+            if (star < 0) { return false; }
+            if (!Str.startsWith(text, pattern[..star])) { return false; }
+            let rest = pattern[star + 1..];
+            if (rest == "") { return true; }
+            for (i in star..(text.length + 1)) { if (Request.glob(rest, text[i..])) { return true; } }
+            return false;
+        }
+    }
+}
