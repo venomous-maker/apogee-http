@@ -62,6 +62,12 @@ namespace apogee {
         fn flashInput(values: HashMap<string, any>)
     }
 
+    // A session's flash: values kept for the next request only (errors, messages).
+    interface FlashStore {
+        fn flash(key: string, value: any)
+        fn flashed(key: string) -> any
+    }
+
     // An object that validates itself once the container has made it (a form request).
     interface ValidatesWhenResolved {
         fn validateResolved()
