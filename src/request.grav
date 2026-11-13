@@ -57,10 +57,14 @@ namespace apogee {
     class Request {
         // The request as it arrived.
         public http: HttpRequest
-        // The per-request scope of the application's container (null without one).
-        public container: Container
+        // The application's container (set by the router; null without one). The
+        // request's own scope of it is made on first use: scope().
+        public app: Container
         // The matched route's name ("" when unnamed, or before routing).
         public routeName: string
+        // The matched route's parameter values in order (bound models where the
+        // router bound one); null before routing, or for a route without any.
+        public routeValues: Array<any>
         // The authenticated user, once a guard has found one (null for a guest).
         public user: any
         // The session, once a session middleware has started one.
@@ -75,11 +79,14 @@ namespace apogee {
         private cookieMap: HashMap<string, string>
         private files: HashMap<string, UploadedFile>
         private methodName: string
+        private scoped: Container
 
         constructor(http: HttpRequest) {
             self.http = http;
-            self.container = null;
+            self.app = null;
+            self.scoped = null;
             self.routeName = "";
+            self.routeValues = null;
             self.user = null;
             self.session = null;
             self.attrs = null; self.inputs = null; self.bodyValue = null; self.bodyParsed = false;
@@ -300,10 +307,23 @@ namespace apogee {
         fn set(key: string, value: any) { if (self.attrs == null) { self.attrs = new HashMap<string, any>(); } self.attrs.put(key, value); }
         fn get(key: string, fallback: any = null) -> any { return self.attrs == null ? fallback : self.attrs.getOr(key, fallback); }
         fn hasAttribute(key: string) -> bool { return self.attrs != null && self.attrs.containsKey(key); }
-        // A service from the request's container scope.
+        // This request's scope of the application's container (made on first
+        // use, with the Request itself in it); null without a container.
+        fn scope() -> Container {
+            if (self.scoped == null && self.app != null) {
+                self.scoped = self.app.scope();
+                self.scoped.provide::<Request>(self);
+            }
+            return self.scoped;
+        }
+        // Ends the scope (the kernel does, once the response is made): frees its
+        // scoped values, and the request they refer to, right away.
+        fn endScope() { if (self.scoped != null) { self.scoped.dispose(); self.scoped = null; } }
+        // A service from the request's scope.
         fn make<T>() -> T {
-            if (self.container == null) { throw new StateError("this request has no container"); }
-            return self.container.make::<T>();
+            let s = self.scope();
+            if (s == null) { throw new StateError("this request has no container"); }
+            return s.make::<T>();
         }
 
         // "admin/*" against "admin/users": `*` matches any run of characters.
