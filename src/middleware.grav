@@ -1,0 +1,49 @@
+// middleware.grav — Middleware: code around a handler (authentication, CSRF,
+// sessions, rate limits, headers), and Pipeline, which joins a list of them
+// and a handler into one function, once: a request then runs through plain
+// calls, with nothing allocated to route it through the chain.
+//
+//   class RequireJson implements Middleware {
+//       fn handle(req: Request, next: fn(Request) -> Response) -> Response {
+//           if (!req.expectsJson()) { abort(406) }
+//           return next(req).header("Vary", "Accept")
+//       }
+//   }
+import "std"
+import "request.grav"
+import "response.grav"
+
+namespace apogee {
+
+    interface Middleware {
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response
+    }
+
+    // Middleware that also runs after the response went out (logging, metrics).
+    interface TerminableMiddleware {
+        fn terminate(req: Request, res: Response)
+    }
+
+    // A function as middleware.
+    class FnMiddleware implements Middleware {
+        private f: fn(Request, fn(Request) -> Response) -> Response
+        constructor(f: fn(Request, fn(Request) -> Response) -> Response) { self.f = f; }
+        fn handle(req: Request, next: fn(Request) -> Response) -> Response { return self.f(req, next); }
+    }
+
+    class Pipeline {
+        // `handler` wrapped by `layers`, the first outermost.
+        static fn compose(layers: Array<Middleware>, handler: fn(Request) -> Response) -> fn(Request) -> Response {
+            let next = handler;
+            let i = layers.size() - 1;
+            while (i >= 0) {
+                next = Pipeline.wrap(layers[i], next);
+                i -= 1;
+            }
+            return next;
+        }
+        private static fn wrap(m: Middleware, next: fn(Request) -> Response) -> fn(Request) -> Response {
+            return fn(r: Request) -> Response { return m.handle(r, next); };
+        }
+    }
+}
