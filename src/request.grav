@@ -68,6 +68,11 @@ namespace apogee {
         fn flashed(key: string) -> any
     }
 
+    // A session's CSRF token (what @csrf and csrf_token() print).
+    interface TokenStore {
+        fn token() -> string
+    }
+
     // An object that validates itself once the container has made it (a form request).
     interface ValidatesWhenResolved {
         fn validateResolved()
