@@ -266,3 +266,18 @@ test "Request: old input through a session, route values, the user" {
     try { r.validate({"email": "required" as any}) } catch (e: StateError) { msg = e.message() }
     assertEq(msg, "validate() needs apogee-validation: import it")
 }
+
+test "req.user: what a guard set, or found once through Request.userResolver" {
+    let looked = new Array<string>()
+    Request.userResolver = fn(req: Request) -> any { looked.push(req.path()); return req.path() == "/mine" ? "ada" as any : null }
+    let a = Request.make("GET", "/mine")
+    assertEq("${a.user} ${a.user} ${looked.size()}", "ada ada 1")          // found once
+    let b = Request.make("GET", "/other")
+    assertEq("${b.user == null} ${b.user == null} ${looked.size()}", "true true 2")
+    let c = Request.make("GET", "/mine")
+    c.user = "set by a guard"
+    assertEq("${c.user} ${looked.size()}", "set by a guard 2")
+    c.user = null                                                           // signed out: not looked for again
+    assertEq("${c.user == null} ${looked.size()}", "true 2")
+    Request.userResolver = null
+}

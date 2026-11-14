@@ -91,8 +91,13 @@ namespace apogee {
         public routeValues: Array<any>
         // The matched route's parameter names, in the same order (null before routing).
         public routeParamNames: Array<string>
-        // The authenticated user, once a guard has found one (null for a guest).
-        public user: any
+        // (the user a guard set, or the resolver found; whether it was looked for)
+        private userValue: any
+        private userLooked: bool
+        // How a request finds its user when nothing set one yet (the framework
+        // asks its default guard), so `req.user` works on any route, not only
+        // behind `auth`. Null: only what a guard sets.
+        static userResolver: fn(Request) -> any = null
         // The session, once a session middleware has started one.
         public session: any
         // Honour a `_method` form field (or X-HTTP-Method-Override header) on POST.
@@ -119,7 +124,8 @@ namespace apogee {
             self.routeName = "";
             self.routeValues = null;
             self.routeParamNames = null;
-            self.user = null;
+            self.userValue = null;
+            self.userLooked = false;
             self.session = null;
             self.attrs = null; self.inputs = null; self.bodyValue = null; self.bodyParsed = false;
             self.cookieMap = null; self.files = null; self.methodName = "";
@@ -129,7 +135,7 @@ namespace apogee {
         fn adopt(other: Request) {
             self.http = other.http; self.app = other.app; self.scoped = other.scoped;
             self.routeName = other.routeName; self.routeValues = other.routeValues; self.routeParamNames = other.routeParamNames;
-            self.user = other.user; self.session = other.session;
+            self.userValue = other.userValue; self.userLooked = other.userLooked; self.session = other.session;
             other.all();                                                    // (parsed once, then shared)
             self.attrs = other.attrs; self.inputs = other.inputs; self.bodyValue = other.bodyValue;
             self.bodyParsed = other.bodyParsed; self.cookieMap = other.cookieMap; self.files = other.files;
@@ -564,6 +570,17 @@ namespace apogee {
         }
         // The signed-in user as a T (null for a guest).
         fn userAs<T>() -> T { return self.user == null ? null : self.user as T; }
+        // The authenticated user (null for a guest): set by a guard, or found on
+        // first read through Request.userResolver.
+        get user() -> any {
+            if (self.userValue == null && !self.userLooked && Request.userResolver != null) {
+                self.userLooked = true;
+                let resolve = Request.userResolver;
+                self.userValue = resolve(self);
+            }
+            return self.userValue;
+        }
+        set user(v: any) { self.userValue = v; self.userLooked = true; }
 
         // ── attributes (what middleware leaves for later) ──────────────────────
         fn set(key: string, value: any) { if (self.attrs == null) { self.attrs = new HashMap<string, any>(); } self.attrs.put(key, value); }
