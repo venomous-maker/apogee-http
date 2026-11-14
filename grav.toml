@@ -3,4 +3,4 @@ lib = "src/all.grav"
 paths = ["src"]
 
 [dependencies]
-apogee-container = { path = "../apogee-container" }
+apogee-container = "github.com/venomous-maker/apogee-container"
