@@ -4,4 +4,4 @@ grav = ">=1.7.0"
 paths = ["src"]
 
 [dependencies]
-apogee-container = "github.com/venomous-maker/apogee-container"
+apogee-container = "github.com/venomous-maker/apogee-container@v0.1.0"
