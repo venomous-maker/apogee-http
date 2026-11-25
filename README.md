@@ -8,7 +8,7 @@ transport: event loops, keep-alive, TLS, compression.
 
 ## Request
 
-```grav
+```typescript
 req.input("user.name")              // JSON body, form, or query string; dotted paths into JSON
 req.text("q")  req.integer("page", 1)  req.number("price")  req.boolean("remember")
 req.date("from")  req.list("tags")  req.all()  req.only(["a", "b"])  req.except(["password"])
@@ -24,7 +24,7 @@ req.make::<Mailer>()                                // from the request's contai
 
 More, in Laravel's spelling:
 
-```grav
+```typescript
 req.string("q")  req.float("price")  req.is(["admin/*"])          // (text, number, pathIs)
 req.input("items.*.sku")            // wildcards: every match, as an Array<any>
 req.hasAll([...])  req.anyFilled([...])  req.isNotFilled("x")  req.keys()  req.map("address")
@@ -48,7 +48,7 @@ request, on first use. A JSON body that does not parse is a 400.
 
 ## Response
 
-```grav
+```typescript
 Response.json(anything, 201)     // plain values, maps, arrays, models, objects
 Response.html(html)  Response.text("ok")  Response.noContent()  Response.created(user, "/users/7")
 Response.redirect("/login")  Response.back(req)  Response.file(path)  Response.download(path, "report.pdf")
@@ -66,7 +66,7 @@ page otherwise, with any headers it carries (`withHeader("Retry-After",
 
 ## Middleware
 
-```grav
+```typescript
 class RequireJson implements Middleware {
     fn handle(req: Request, next: fn(Request) -> Response) -> Response {
         if (!req.expectsJson()) { abort(406) }
@@ -81,7 +81,7 @@ after the response is sent.
 
 ## API resources
 
-```grav
+```typescript
 class UserResource extends JsonResource {
     fn toArray(req: Request) -> HashMap<string, any> {
         let u = self.resource as User
