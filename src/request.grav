@@ -78,6 +78,22 @@ namespace apogee {
         fn validateResolved()
     }
 
+    // What the router matched, as a request sees it (Request.matched).
+    class MatchedRoute {
+        // The pattern ("/users/{id}"), and the route's name ("" when unnamed).
+        public uri: string
+        public name: string
+        public methods: Array<string>
+        // "UserController@show" for a controller's action ("" for a closure).
+        public action: string
+        // The middleware names it runs (groups as written).
+        public middleware: Array<string>
+        constructor(uri: string, name: string, methods: Array<string>, action: string, middleware: Array<string>) {
+            self.uri = uri; self.name = name; self.methods = methods; self.action = action; self.middleware = middleware;
+        }
+        fn toString() -> string { return Str.join(self.methods, "|") + " " + self.uri + (self.name == "" ? "" : " (" + self.name + ")"); }
+    }
+
     class Request {
         // The request as it arrived.
         public http: HttpRequest
@@ -91,6 +107,9 @@ namespace apogee {
         public routeValues: Array<any>
         // The matched route's parameter names, in the same order (null before routing).
         public routeParamNames: Array<string>
+        // The route the router matched (null before routing, or for none): its
+        // pattern, name, methods, action and middleware.
+        public matched: MatchedRoute
         // (the user a guard set, or the resolver found; whether it was looked for)
         private userValue: any
         private userLooked: bool
@@ -124,6 +143,7 @@ namespace apogee {
             self.routeName = "";
             self.routeValues = null;
             self.routeParamNames = null;
+            self.matched = null;
             self.userValue = null;
             self.userLooked = false;
             self.session = null;
@@ -135,6 +155,7 @@ namespace apogee {
         fn adopt(other: Request) {
             self.http = other.http; self.app = other.app; self.scoped = other.scoped;
             self.routeName = other.routeName; self.routeValues = other.routeValues; self.routeParamNames = other.routeParamNames;
+            self.matched = other.matched;
             self.userValue = other.userValue; self.userLooked = other.userLooked; self.session = other.session;
             other.all();                                                    // (parsed once, then shared)
             self.attrs = other.attrs; self.inputs = other.inputs; self.bodyValue = other.bodyValue;
@@ -563,6 +584,10 @@ namespace apogee {
         }
 
         // ── the route ──────────────────────────────────────────────────────────
+        // The matched route's pattern ("/users/{id}"; "" before routing): what
+        // metrics and logs group requests by, where the path ("/users/42") would
+        // make one group per user.
+        fn routeUri() -> string { return self.matched == null ? "" : self.matched.uri; }
         // A route value: the model the router bound for it, else its text.
         fn route(name: string) -> any {
             let bound = self.get(name);

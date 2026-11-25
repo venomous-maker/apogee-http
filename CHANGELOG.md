@@ -6,6 +6,10 @@ compiler versions it builds with.
 
 ## Unreleased
 
+- `Request.matched`: the route the router matched (`MatchedRoute`: its pattern,
+  name, methods, action and middleware), and `routeUri()`, its pattern
+  ("/users/{id}"), for metrics and logs to group requests by.
+
 ## 0.2.0 (2026-11-20)
 
 ### Requirements
